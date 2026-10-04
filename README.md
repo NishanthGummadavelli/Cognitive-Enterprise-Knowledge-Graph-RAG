@@ -1,14 +1,14 @@
-\# Cognitive Enterprise Knowledge Graph and RAG System
+# Cognitive Enterprise Knowledge Graph and RAG System
 
 
 
-\## Team
+## Team
 
 CodeCrafters
 
 
 
-\## Project Overview
+## Project Overview
 
 
 
@@ -22,7 +22,7 @@ from enterprise documents.
 
 
 
-\## Project Status
+## Project Status
 
 
 
