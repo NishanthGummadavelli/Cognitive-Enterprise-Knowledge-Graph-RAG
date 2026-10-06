@@ -1,0 +1,19 @@
+# RAG & document processing
+llama-index
+sentence-transformers
+chromadb
+pymupdf
+python-docx
+
+# Knowledge graph
+neo4j
+
+# Backend API
+fastapi
+uvicorn
+
+# Configuration
+python-dotenv
+
+# Testing
+pytest

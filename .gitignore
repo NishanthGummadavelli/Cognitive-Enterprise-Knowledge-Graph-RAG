@@ -34,3 +34,6 @@ Thumbs.db
 
 # Temporary files
 *.tmp
+
+# Local dependency snapshot
+requirements-full.txt
