@@ -37,3 +37,9 @@ Thumbs.db
 
 # Local dependency snapshot
 requirements-full.txt
+
+# Project data
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
