@@ -4,7 +4,6 @@ sentence-transformers
 chromadb
 pymupdf
 python-docx
-
 # Knowledge graph
 neo4j
 
@@ -17,3 +16,9 @@ python-dotenv
 
 # Testing
 pytest
+
+# Machine Learning
+scikit-learn
+
+# External dataset loading
+datasets
