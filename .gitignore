@@ -1,4 +1,7 @@
+
+# ==========================================
 # Python
+# ==========================================
 __pycache__/
 *.py[cod]
 *.pyo
@@ -8,54 +11,61 @@ venv/
 .venv/
 env/
 
-# Environment variables
+# ==========================================
+# Environment variables and secrets
+# ==========================================
 .env
 .env.*
-
-# Jupyter
-.ipynb_checkpoints/
-
-# IDE
-.vscode/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
-
-# Local databases
-*.db
-
-# Secrets
 *.pem
 *.key
 
-# Temporary files
+# ==========================================
+# IDE and OS files
+# ==========================================
+.vscode/
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+
+# ==========================================
+# Logs and temporary files
+# ==========================================
+*.log
 *.tmp
 
-# Local dependency snapshot
-requirements-full.txt
-
-# Project data
-data/raw/*
-data/processed/*
-!data/raw/.gitkeep
-!data/processed/.gitkeep
-
-# Persistent vector databases and local test databases
+# ==========================================
+# Local databases
+# ==========================================
+*.db
 data/chroma_db/
 data/chroma_test_management/
 data/chroma_test_service/
-data/document_registry.db
 
-# Local training datasets
+# ==========================================
+# Local dependency snapshots
+# ==========================================
+requirements-full.txt
+
+# ==========================================
+# Project data
+# ==========================================
+data/raw/*
+data/processed/*
 data/training/
 
-# Trained model artifacts and experiment outputs
-models/
-backups/
+!data/raw/.gitkeep
+!data/processed/.gitkeep
 
-# Python cache
-__pycache__/
+# ==========================================
+# Generated model artifacts
+# ==========================================
+models/*
+!models/classification/
+
+models/classification/*
+!models/classification/document_classifier.joblib
+
+# ==========================================
+# Backups and experiment outputs
+# ==========================================
+backups/
