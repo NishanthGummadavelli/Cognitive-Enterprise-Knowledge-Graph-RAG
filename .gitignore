@@ -43,3 +43,19 @@ data/raw/*
 data/processed/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
+
+# Persistent vector databases and local test databases
+data/chroma_db/
+data/chroma_test_management/
+data/chroma_test_service/
+data/document_registry.db
+
+# Local training datasets
+data/training/
+
+# Trained model artifacts and experiment outputs
+models/
+backups/
+
+# Python cache
+__pycache__/
