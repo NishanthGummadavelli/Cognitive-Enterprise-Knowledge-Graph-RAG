@@ -2,6 +2,7 @@
 llama-index
 sentence-transformers
 chromadb
+rank-bm25
 pymupdf
 python-docx
 # Knowledge graph

@@ -1,9 +1,9 @@
 
-"""Store and retrieve BGE embeddings using a persistent ChromaDB collection."""
+"""Store and retrieve BGE embeddings using scope-aware ChromaDB search."""
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import chromadb
 
@@ -20,9 +20,11 @@ DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "chroma_db"
 # Use a consistent collection name throughout the project.
 DEFAULT_COLLECTION_NAME = "enterprise_documents"
 
+VALID_SCOPE_TYPES = {"personal", "project"}
+
 
 class VectorStore:
-    """Manage persistent document embeddings and semantic retrieval."""
+    """Manage persistent document embeddings and scope-aware retrieval."""
 
     def __init__(
         self,
@@ -42,22 +44,16 @@ class VectorStore:
             RuntimeError: If ChromaDB initialization fails.
         """
 
-        if not collection_name.strip():
+        if not isinstance(collection_name, str) or not collection_name.strip():
             raise ValueError("Collection name cannot be empty.")
 
         self.encoder = encoder
 
         try:
-            # Create the database directory if it does not exist.
             db_path.mkdir(parents=True, exist_ok=True)
 
-            # Connect to persistent local vector storage.
-            self.client = chromadb.PersistentClient(
-                path=str(db_path)
-            )
+            self.client = chromadb.PersistentClient(path=str(db_path))
 
-            # Use cosine distance for semantic similarity search.
-            # Supply our own BGE vectors instead of Chroma's default model.
             self.collection = self.client.get_or_create_collection(
                 name=collection_name,
                 metadata={"hnsw:space": "cosine"},
@@ -68,6 +64,108 @@ class VectorStore:
             raise RuntimeError(
                 f"Could not initialize ChromaDB: {error}"
             ) from error
+
+    @staticmethod
+    def _validate_scope(
+        scope_type: str,
+        scope_id: str,
+    ) -> None:
+        """Validate the scope required for a retrieval operation.
+
+        Args:
+            scope_type: Either personal or project.
+            scope_id: User ID for personal scope or project ID for project scope.
+
+        Raises:
+            ValueError: If either scope value is invalid.
+        """
+
+        if not isinstance(scope_type, str) or scope_type not in VALID_SCOPE_TYPES:
+            raise ValueError(
+                "scope_type must be either 'personal' or 'project'."
+            )
+
+        if not isinstance(scope_id, str) or not scope_id.strip():
+            raise ValueError("scope_id must be a non-empty string.")
+
+    @classmethod
+    def _validate_chunk_metadata(
+        cls,
+        metadata: Mapping[str, object],
+    ) -> None:
+        """Validate the authorization metadata attached to a stored chunk.
+
+        Args:
+            metadata: Metadata belonging to one ingested chunk.
+
+        Raises:
+            ValueError: If scope or uploader information is missing or invalid.
+        """
+
+        scope_type = metadata.get("scope_type")
+        scope_id = metadata.get("scope_id")
+        uploaded_by = metadata.get("uploaded_by")
+
+        if not isinstance(scope_type, str):
+            raise ValueError("Chunk metadata must contain scope_type.")
+
+        if not isinstance(scope_id, str):
+            raise ValueError("Chunk metadata must contain scope_id.")
+
+        if not isinstance(uploaded_by, str) or not uploaded_by.strip():
+            raise ValueError("Chunk metadata must contain uploaded_by.")
+
+        cls._validate_scope(scope_type, scope_id)
+
+        if scope_type == "personal" and scope_id != uploaded_by:
+            raise ValueError(
+                "For personal scope, scope_id must match uploaded_by."
+            )
+
+    @classmethod
+    def _validate_ingestion_scope(
+        cls,
+        result: IngestionResult,
+    ) -> None:
+        """Ensure all chunks in a document belong to one valid scope.
+
+        Args:
+            result: Ingestion output whose chunks will be stored.
+
+        Raises:
+            ValueError: If chunks are missing or have inconsistent scopes.
+        """
+
+        if not result.chunks:
+            raise ValueError("Cannot store a document without chunks.")
+
+        first_metadata = result.chunks[0].metadata
+        cls._validate_chunk_metadata(first_metadata)
+
+        expected_scope = (
+            first_metadata["scope_type"],
+            first_metadata["scope_id"],
+            first_metadata["uploaded_by"],
+        )
+
+        for item in result.chunks:
+            cls._validate_chunk_metadata(item.metadata)
+
+            actual_scope = (
+                item.metadata["scope_type"],
+                item.metadata["scope_id"],
+                item.metadata["uploaded_by"],
+            )
+
+            if actual_scope != expected_scope:
+                raise ValueError(
+                    "All chunks in a document must have identical scope metadata."
+                )
+
+            if item.metadata.get("document_id") != result.document_id:
+                raise ValueError(
+                    "Chunk metadata document_id does not match the ingestion result."
+                )
 
     @staticmethod
     def _prepare_metadata(
@@ -85,7 +183,6 @@ class VectorStore:
         prepared: dict[str, str | int | float | bool] = {}
 
         for key, value in metadata.items():
-            # Serialize structured lists as JSON strings.
             if isinstance(value, (list, tuple, dict)):
                 prepared[key] = json.dumps(value)
 
@@ -110,14 +207,12 @@ class VectorStore:
             Number of chunks successfully submitted to ChromaDB.
 
         Raises:
-            ValueError: If the ingestion result has no chunks.
+            ValueError: If chunks or scope metadata are invalid.
             RuntimeError: If embedding or storage fails.
         """
 
-        if not result.chunks:
-            raise ValueError("Cannot store a document without chunks.")
+        self._validate_ingestion_scope(result)
 
-        # Extract canonical chunk IDs and their original text.
         chunk_ids = [
             item.chunk.chunk_id for item in result.chunks
         ]
@@ -126,17 +221,17 @@ class VectorStore:
             item.chunk.text for item in result.chunks
         ]
 
-        # Prepare metadata for each corresponding chunk.
         metadatas = [
             self._prepare_metadata(item.metadata)
             for item in result.chunks
         ]
 
+        if len(set(chunk_ids)) != len(chunk_ids):
+            raise ValueError("Chunk IDs must be unique within a document.")
+
         try:
-            # Generate BGE vectors for all chunks in one operation.
             embeddings = self.encoder.encode_documents(documents)
 
-            # Store vectors, text, metadata and stable chunk IDs together.
             self.collection.add(
                 ids=chunk_ids,
                 embeddings=embeddings.tolist(),
@@ -151,7 +246,10 @@ class VectorStore:
 
         return len(chunk_ids)
 
-    def upsert_document(self, result: IngestionResult) -> int:
+    def upsert_document(
+        self,
+        result: IngestionResult,
+    ) -> int:
         """Insert or replace all chunks belonging to an ingested document.
 
         Args:
@@ -161,16 +259,20 @@ class VectorStore:
             Number of chunks stored.
 
         Raises:
-            ValueError: If the document has no chunks.
+            ValueError: If chunks or scope metadata are invalid.
             RuntimeError: If embedding or storage fails.
         """
 
-        if not result.chunks:
-            raise ValueError("Cannot store a document without chunks.")
+        self._validate_ingestion_scope(result)
 
-        # Extract chunk IDs, text and metadata in matching order.
-        chunk_ids = [item.chunk.chunk_id for item in result.chunks]
-        documents = [item.chunk.text for item in result.chunks]
+        chunk_ids = [
+            item.chunk.chunk_id for item in result.chunks
+        ]
+
+        documents = [
+            item.chunk.text for item in result.chunks
+        ]
+
         metadatas = [
             self._prepare_metadata(item.metadata)
             for item in result.chunks
@@ -180,10 +282,8 @@ class VectorStore:
             raise ValueError("Chunk IDs must be unique within a document.")
 
         try:
-            # Generate embeddings before changing the stored records.
             embeddings = self.encoder.encode_documents(documents)
 
-            # Upsert makes retries safe for the same version-specific IDs.
             self.collection.upsert(
                 ids=chunk_ids,
                 embeddings=embeddings.tolist(),
@@ -198,7 +298,10 @@ class VectorStore:
 
         return len(chunk_ids)
 
-    def delete_chunks(self, chunk_ids: list[str]) -> int:
+    def delete_chunks(
+        self,
+        chunk_ids: list[str],
+    ) -> int:
         """Delete a selected set of chunk IDs from ChromaDB.
 
         Args:
@@ -211,12 +314,13 @@ class VectorStore:
         if not chunk_ids:
             return 0
 
-        if any(not isinstance(item, str) or not item.strip()
-               for item in chunk_ids):
+        if any(
+            not isinstance(item, str) or not item.strip()
+            for item in chunk_ids
+        ):
             raise ValueError("All chunk IDs must be non-empty strings.")
 
         try:
-            # Remove only the explicitly supplied chunks.
             self.collection.delete(ids=chunk_ids)
 
         except Exception as error:
@@ -226,7 +330,10 @@ class VectorStore:
 
         return len(chunk_ids)
 
-    def get_document_chunk_ids(self, document_id: str) -> list[str]:
+    def get_document_chunk_ids(
+        self,
+        document_id: str,
+    ) -> list[str]:
         """Return all stored chunk IDs belonging to one document.
 
         Args:
@@ -240,7 +347,6 @@ class VectorStore:
             raise ValueError("Document ID cannot be empty.")
 
         try:
-            # Retrieve IDs using the shared document metadata.
             records = self.collection.get(
                 where={"document_id": document_id.strip()},
                 include=["metadatas"],
@@ -257,35 +363,60 @@ class VectorStore:
         self,
         query: str,
         top_k: int = 5,
+        scope_type: str | None = None,
+        scope_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Retrieve the most relevant chunks for a user query.
+        """Retrieve semantically relevant chunks from one authorized scope.
+
+        Both scope arguments are mandatory. This method applies the scope
+        filter inside ChromaDB instead of retrieving globally and filtering
+        the results afterward.
 
         Args:
             query: Natural-language search question.
             top_k: Maximum number of results to retrieve.
+            scope_type: Personal or project.
+            scope_id: User ID for personal scope or project ID for project scope.
 
         Returns:
-            Ranked chunks with text, metadata and distance.
+            Ranked chunks containing text, metadata and cosine distance.
 
         Raises:
-            ValueError: If the query or result count is invalid.
+            ValueError: If the query, result count or scope is invalid.
             RuntimeError: If semantic retrieval fails.
         """
 
-        if top_k <= 0:
-            raise ValueError("top_k must be greater than zero.")
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("Search query cannot be empty.")
+
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
+            raise ValueError("top_k must be a positive integer.")
+
+        if scope_type is None or scope_id is None:
+            raise ValueError(
+                "Both scope_type and scope_id are required for retrieval."
+            )
+
+        self._validate_scope(scope_type, scope_id)
 
         if self.collection.count() == 0:
             return []
 
-        try:
-            # Convert the question into a BGE query vector.
-            query_vector = self.encoder.encode_query(query)
+        # Restrict ChromaDB's search to the requested knowledge space.
+        scope_filter = {
+            "$and": [
+                {"scope_type": scope_type},
+                {"scope_id": scope_id},
+            ]
+        }
 
-            # Ask ChromaDB for the nearest stored vectors.
+        try:
+            query_vector = self.encoder.encode_query(query.strip())
+
             results = self.collection.query(
                 query_embeddings=[query_vector.tolist()],
-                n_results=min(top_k, self.collection.count()),
+                n_results=int(min(top_k, self.collection.count())),
+                where=scope_filter,
                 include=["documents", "metadatas", "distances"],
             )
 
@@ -294,16 +425,31 @@ class VectorStore:
                 f"Semantic search failed: {error}"
             ) from error
 
-        # Convert ChromaDB's grouped result format into simple records.
-        retrieved_chunks = []
+        retrieved_chunks: list[dict[str, Any]] = []
 
-        for index, chunk_id in enumerate(results["ids"][0]):
+        result_ids = results.get("ids", [[]])
+        if not result_ids:
+            return []
+
+        for index, chunk_id in enumerate(result_ids[0]):
+            metadata = results["metadatas"][0][index]
+
+            # Defensive validation: do not return a result outside the
+            # requested scope, even if unexpected data is encountered.
+            if (
+                metadata.get("scope_type") != scope_type
+                or metadata.get("scope_id") != scope_id
+            ):
+                continue
+
             retrieved_chunks.append(
                 {
                     "chunk_id": chunk_id,
                     "text": results["documents"][0][index],
-                    "metadata": results["metadatas"][0][index],
+                    "metadata": metadata,
                     "distance": results["distances"][0][index],
+                    "scope_type": scope_type,
+                    "scope_id": scope_id,
                 }
             )
 

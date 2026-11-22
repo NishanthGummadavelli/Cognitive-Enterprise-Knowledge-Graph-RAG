@@ -12,9 +12,11 @@ from src.ingestion.pipeline import IngestedChunk, IngestionResult
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 TEST_DB_PATH = PROJECT_ROOT / "data" / "chroma_test_management"
 
+TEST_USER_ID = "management_test_user"
+
 
 def create_test_document(version: int) -> IngestionResult:
-    """Create a small document fixture for vector-store testing."""
+    """Create a scoped document fixture for vector-store testing."""
 
     document_id = "doc_test_management"
 
@@ -38,6 +40,9 @@ def create_test_document(version: int) -> IngestionResult:
         "chunk_id": chunk.chunk_id,
         "chunk_index": 0,
         "predicted_category": "HR",
+        "scope_type": "personal",
+        "scope_id": TEST_USER_ID,
+        "uploaded_by": TEST_USER_ID,
     }
 
     return IngestionResult(
@@ -49,14 +54,18 @@ def create_test_document(version: int) -> IngestionResult:
         classification_confidence=0.9,
         total_characters=len(chunk.text),
         total_chunks=1,
-        chunks=[IngestedChunk(chunk=chunk, metadata=metadata)],
+        chunks=[
+            IngestedChunk(
+                chunk=chunk,
+                metadata=metadata,
+            )
+        ],
     )
 
 
 def main() -> None:
     """Verify insertion, replacement and deletion in isolated storage."""
 
-    # Load BGE once and initialize dedicated test storage.
     encoder = EmbeddingEncoder()
 
     vector_store = VectorStore(
@@ -69,7 +78,7 @@ def main() -> None:
     print("CHROMADB MANAGEMENT TEST")
     print("=" * 55)
 
-    # Reset only the dedicated test collection for repeatable results.
+    # Reset only the dedicated test document.
     vector_store.collection.delete(
         where={"document_id": "doc_test_management"}
     )
@@ -83,6 +92,20 @@ def main() -> None:
 
     assert stored == 1
     assert vector_store.count() == 1
+
+    # Verify that the inserted chunk is retrievable in its own scope.
+    version_one_results = vector_store.search(
+        query="employee annual leave approval",
+        top_k=5,
+        scope_type="personal",
+        scope_id=TEST_USER_ID,
+    )
+
+    assert len(version_one_results) == 1
+    assert (
+        version_one_results[0]["metadata"]["scope_id"]
+        == TEST_USER_ID
+    )
 
     # Insert version 2 using a separate chunk ID.
     version_two = create_test_document(version=2)
