@@ -1,5 +1,5 @@
 
-"""Manage persistent enterprise document identity and version history."""
+"""Manage scoped document identity, version history and deletion."""
 
 import sqlite3
 import uuid
@@ -7,13 +7,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-# Resolve the project root independently of the terminal's working directory.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-# Store the registry separately from ChromaDB.
-DEFAULT_REGISTRY_PATH = (
-    PROJECT_ROOT / "data" / "document_registry.db"
-)
+DEFAULT_REGISTRY_PATH = PROJECT_ROOT / "data" / "document_registry.db"
+
+VALID_SCOPE_TYPES = {"personal", "project"}
 
 
 @dataclass
@@ -27,13 +25,13 @@ class RegistryResult:
 
 
 class DocumentRegistry:
-    """Initialize and manage the SQLite enterprise document registry."""
+    """Manage personal and collaborative project document records."""
 
     def __init__(
         self,
         db_path: Path = DEFAULT_REGISTRY_PATH,
     ) -> None:
-        """Initialize the registry database and create its tables.
+        """Initialize the registry database.
 
         Args:
             db_path: Location of the SQLite database file.
@@ -45,12 +43,10 @@ class DocumentRegistry:
         self.db_path = Path(db_path)
 
         try:
-            # Ensure the database directory exists.
             self.db_path.parent.mkdir(
                 parents=True,
                 exist_ok=True,
             )
-
             self._initialize_database()
 
         except sqlite3.Error as error:
@@ -58,19 +54,49 @@ class DocumentRegistry:
                 f"Could not initialize document registry: {error}"
             ) from error
 
+    @staticmethod
+    def _validate_scope(
+        scope_type: str,
+        scope_id: str,
+        uploaded_by: str,
+    ) -> None:
+        """Validate the ownership and scope information.
+
+        Args:
+            scope_type: Either personal or project.
+            scope_id: User ID or project ID.
+            uploaded_by: ID of the user uploading the document.
+
+        Raises:
+            ValueError: If any scope field is invalid.
+        """
+
+        if scope_type not in VALID_SCOPE_TYPES:
+            raise ValueError(
+                "Scope type must be either 'personal' or 'project'."
+            )
+
+        for field_name, value in (
+            ("scope_id", scope_id),
+            ("uploaded_by", uploaded_by),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} cannot be empty.")
+
+        if scope_type == "personal" and scope_id != uploaded_by:
+            raise ValueError(
+                "A personal document must belong to its uploading user."
+            )
+
     def _initialize_database(self) -> None:
-        """Create document tables and indexes if they do not exist."""
+        """Create or safely migrate the registry database."""
 
         connection = sqlite3.connect(self.db_path)
 
         try:
-            # Enable foreign-key enforcement for this connection.
             connection.execute("PRAGMA foreign_keys = ON")
-
-            # Improve reliability of persistent database operations.
             connection.execute("PRAGMA journal_mode = WAL")
 
-            # Store the current identity and state of each document.
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS documents (
@@ -88,7 +114,35 @@ class DocumentRegistry:
                 """
             )
 
-            # Preserve the information associated with every document version.
+            # Add scope columns to databases created by the earlier version.
+            existing_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(documents)"
+                ).fetchall()
+            }
+
+            migrations = {
+                "scope_type": (
+                    "TEXT NOT NULL DEFAULT 'legacy'"
+                ),
+                "scope_id": (
+                    "TEXT NOT NULL DEFAULT 'legacy_unassigned'"
+                ),
+                "uploaded_by": (
+                    "TEXT NOT NULL DEFAULT 'legacy_unassigned'"
+                ),
+            }
+
+            for column_name, column_definition in migrations.items():
+                if column_name not in existing_columns:
+                    connection.execute(
+                        f"""
+                        ALTER TABLE documents
+                        ADD COLUMN {column_name} {column_definition}
+                        """
+                    )
+
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS document_versions (
@@ -99,9 +153,7 @@ class DocumentRegistry:
                     file_hash TEXT NOT NULL,
                     content_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-
                     PRIMARY KEY (document_id, version),
-
                     FOREIGN KEY (document_id)
                         REFERENCES documents(document_id)
                         ON DELETE CASCADE
@@ -109,28 +161,28 @@ class DocumentRegistry:
                 """
             )
 
-            # Indexes improve duplicate lookup performance.
+            # Scope-aware indexes support isolated duplicate detection.
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS
-                idx_documents_file_hash
-                ON documents(file_hash)
+                idx_documents_scope_file_hash
+                ON documents(scope_type, scope_id, file_hash)
                 """
             )
 
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS
-                idx_documents_content_hash
-                ON documents(content_hash)
+                idx_documents_scope_content_hash
+                ON documents(scope_type, scope_id, content_hash)
                 """
             )
 
             connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS
-                idx_documents_filename
-                ON documents(filename)
+                idx_documents_scope_filename
+                ON documents(scope_type, scope_id, filename)
                 """
             )
 
@@ -164,24 +216,32 @@ class DocumentRegistry:
         filename: str,
         file_hash: str,
         content_hash: str,
+        scope_type: str,
+        scope_id: str,
+        uploaded_by: str,
     ) -> RegistryResult:
-        """Register a new document, skip duplicates or create a new version.
+        """Register a document or update its existing version within a scope.
+
+        Duplicate detection is limited to the supplied scope. The same file
+        can therefore exist independently in different personal spaces or
+        collaborative projects.
 
         Args:
             filename: Name of the uploaded document.
             file_hash: SHA-256 hash of the original file.
             content_hash: SHA-256 hash of normalized extracted content.
+            scope_type: Personal or project.
+            scope_id: User ID for personal scope or project ID for project scope.
+            uploaded_by: User ID of the uploader.
 
         Returns:
             Registration result containing document identity and version.
 
         Raises:
-            ValueError: If required inputs are empty or the filename is
-                ambiguous.
+            ValueError: If required inputs or scope information are invalid.
             RuntimeError: If the database operation fails.
         """
 
-        # Validate all inputs before accessing the database.
         if not all(
             isinstance(value, str) and value.strip()
             for value in (filename, file_hash, content_hash)
@@ -190,7 +250,11 @@ class DocumentRegistry:
                 "Filename and both document hashes are required."
             )
 
+        self._validate_scope(scope_type, scope_id, uploaded_by)
+
         filename = filename.strip()
+        scope_id = scope_id.strip()
+        uploaded_by = uploaded_by.strip()
 
         connection = sqlite3.connect(
             self.db_path,
@@ -198,19 +262,22 @@ class DocumentRegistry:
         )
 
         try:
-            # Acquire a write lock to avoid conflicting updates.
             connection.execute("BEGIN IMMEDIATE")
 
-            # Check whether this exact file is already registered.
+            scope_parameters = (scope_type, scope_id)
+
+            # Check for an identical original file in this scope.
             existing_file = connection.execute(
                 """
                 SELECT document_id, current_version
                 FROM documents
-                WHERE file_hash = ?
+                WHERE scope_type = ?
+                  AND scope_id = ?
+                  AND file_hash = ?
                   AND status = 'active'
                 LIMIT 1
                 """,
-                (file_hash,),
+                (*scope_parameters, file_hash),
             ).fetchone()
 
             if existing_file:
@@ -223,22 +290,23 @@ class DocumentRegistry:
                     duplicate_reason="identical_file",
                 )
 
-            # Find an existing active document with this filename.
+            # Find an existing document with the same filename in this scope.
             matching_documents = connection.execute(
                 """
                 SELECT document_id, current_version, content_hash
                 FROM documents
-                WHERE filename = ?
+                WHERE scope_type = ?
+                  AND scope_id = ?
+                  AND filename = ?
                   AND status = 'active'
                 """,
-                (filename,),
+                (*scope_parameters, filename),
             ).fetchall()
 
-            # Avoid updating an ambiguous document identity.
             if len(matching_documents) > 1:
                 raise ValueError(
-                    f"Multiple active documents use the filename "
-                    f"'{filename}'. A unique document identifier is required."
+                    f"Multiple active documents use filename '{filename}' "
+                    "within this scope."
                 )
 
             if matching_documents:
@@ -246,17 +314,25 @@ class DocumentRegistry:
                     matching_documents[0]
                 )
 
-                # Check whether the new content belongs to another document.
+                # Check for identical content in another document in the
+                # same scope.
                 existing_content = connection.execute(
                     """
                     SELECT document_id, current_version
                     FROM documents
-                    WHERE content_hash = ?
+                    WHERE scope_type = ?
+                      AND scope_id = ?
+                      AND content_hash = ?
                       AND status = 'active'
                       AND document_id != ?
                     LIMIT 1
                     """,
-                    (content_hash, document_id),
+                    (
+                        scope_type,
+                        scope_id,
+                        content_hash,
+                        document_id,
+                    ),
                 ).fetchone()
 
                 if existing_content:
@@ -269,7 +345,6 @@ class DocumentRegistry:
                         duplicate_reason="identical_content",
                     )
 
-                # Avoid creating a version when extracted content is unchanged.
                 if content_hash == previous_content_hash:
                     connection.commit()
 
@@ -280,7 +355,6 @@ class DocumentRegistry:
                         duplicate_reason="unchanged_content",
                     )
 
-                # Create the next version while retaining document identity.
                 new_version = current_version + 1
 
                 connection.execute(
@@ -303,13 +377,13 @@ class DocumentRegistry:
                     ),
                 )
 
-                # Update the current document record.
                 connection.execute(
                     """
                     UPDATE documents
                     SET file_hash = ?,
                         content_hash = ?,
                         current_version = ?,
+                        uploaded_by = ?,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE document_id = ?
                     """,
@@ -317,6 +391,7 @@ class DocumentRegistry:
                         file_hash,
                         content_hash,
                         new_version,
+                        uploaded_by,
                         document_id,
                     ),
                 )
@@ -329,16 +404,22 @@ class DocumentRegistry:
                     version=new_version,
                 )
 
-            # No matching filename: check for identical content elsewhere.
+            # Check identical content elsewhere in this scope.
             existing_content = connection.execute(
                 """
                 SELECT document_id, current_version
                 FROM documents
-                WHERE content_hash = ?
+                WHERE scope_type = ?
+                  AND scope_id = ?
+                  AND content_hash = ?
                   AND status = 'active'
                 LIMIT 1
                 """,
-                (content_hash,),
+                (
+                    scope_type,
+                    scope_id,
+                    content_hash,
+                ),
             ).fetchone()
 
             if existing_content:
@@ -351,10 +432,8 @@ class DocumentRegistry:
                     duplicate_reason="identical_content",
                 )
 
-            # Generate a new identity for a completely new document.
             document_id = f"doc_{uuid.uuid4().hex}"
 
-            # Insert the current document record.
             connection.execute(
                 """
                 INSERT INTO documents (
@@ -362,19 +441,24 @@ class DocumentRegistry:
                     filename,
                     file_hash,
                     content_hash,
-                    current_version
+                    current_version,
+                    scope_type,
+                    scope_id,
+                    uploaded_by
                 )
-                VALUES (?, ?, ?, ?, 1)
+                VALUES (?, ?, ?, ?, 1, ?, ?, ?)
                 """,
                 (
                     document_id,
                     filename,
                     file_hash,
                     content_hash,
+                    scope_type,
+                    scope_id,
+                    uploaded_by,
                 ),
             )
 
-            # Record the initial version.
             connection.execute(
                 """
                 INSERT INTO document_versions (
@@ -394,7 +478,6 @@ class DocumentRegistry:
                 ),
             )
 
-            # Commit both records as one transaction.
             connection.commit()
 
             return RegistryResult(
@@ -420,22 +503,36 @@ class DocumentRegistry:
     def delete_document(
         self,
         document_id: str,
+        scope_type: str,
+        scope_id: str,
     ) -> RegistryResult:
-        """Soft-delete a document while preserving its version history.
+        """Soft-delete a document after verifying its scope.
+
+        This method verifies scope ownership but does not determine project
+        membership or project-owner permissions. Those checks belong in the
+        document management service.
 
         Args:
-            document_id: Stable identifier of the document to delete.
+            document_id: Stable identifier of the document.
+            scope_type: Expected document scope type.
+            scope_id: Expected user or project scope ID.
 
         Returns:
             Result describing the deletion operation.
 
         Raises:
-            ValueError: If the document ID is empty or not active.
+            ValueError: If the document is missing, deleted or outside scope.
             RuntimeError: If the database operation fails.
         """
 
         if not isinstance(document_id, str) or not document_id.strip():
             raise ValueError("Document ID cannot be empty.")
+
+        if not isinstance(scope_id, str) or not scope_id.strip():
+            raise ValueError("Scope ID cannot be empty.")
+
+        if scope_type not in VALID_SCOPE_TYPES:
+            raise ValueError("Invalid document scope type.")
 
         connection = sqlite3.connect(
             self.db_path,
@@ -443,12 +540,11 @@ class DocumentRegistry:
         )
 
         try:
-            # Acquire a write lock before changing the document status.
             connection.execute("BEGIN IMMEDIATE")
 
             existing = connection.execute(
                 """
-                SELECT current_version, status
+                SELECT current_version, status, scope_type, scope_id
                 FROM documents
                 WHERE document_id = ?
                 """,
@@ -460,14 +556,23 @@ class DocumentRegistry:
                     f"Document not found: {document_id}"
                 )
 
-            current_version, status = existing
+            current_version, status, stored_scope_type, stored_scope_id = (
+                existing
+            )
+
+            if (
+                stored_scope_type != scope_type
+                or stored_scope_id != scope_id.strip()
+            ):
+                raise ValueError(
+                    "Document does not belong to the supplied scope."
+                )
 
             if status == "deleted":
                 raise ValueError(
                     f"Document is already deleted: {document_id}"
                 )
 
-            # Mark the document as deleted without removing its history.
             connection.execute(
                 """
                 UPDATE documents
@@ -510,7 +615,7 @@ class DocumentRegistry:
             document_id: Stable document identifier.
 
         Returns:
-            Current document details, or None if it does not exist.
+            Document details, including ownership and scope, or None.
         """
 
         if not isinstance(document_id, str) or not document_id.strip():
@@ -528,7 +633,12 @@ class DocumentRegistry:
                     file_hash,
                     content_hash,
                     current_version,
-                    status
+                    status,
+                    scope_type,
+                    scope_id,
+                    uploaded_by,
+                    created_at,
+                    updated_at
                 FROM documents
                 WHERE document_id = ?
                 """,

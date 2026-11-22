@@ -13,6 +13,7 @@ uvicorn
 
 # Configuration
 python-dotenv
+certifi
 
 # Testing
 pytest
