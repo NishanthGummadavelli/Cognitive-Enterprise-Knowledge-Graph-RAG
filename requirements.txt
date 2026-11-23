@@ -5,6 +5,10 @@ chromadb
 rank-bm25
 pymupdf
 python-docx
+
+# Local LLM integration
+ollama
+
 # Knowledge graph
 neo4j
 
@@ -15,6 +19,11 @@ uvicorn
 # Configuration
 python-dotenv
 certifi
+
+# Database
+SQLAlchemy>=2.0,<3.0
+psycopg[binary]>=3.2,<4.0
+alembic>=1.14,<2.0
 
 # Testing
 pytest
